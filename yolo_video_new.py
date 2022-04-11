@@ -2,32 +2,42 @@
 # python yolo_video.py --input videos/airport.mp4 --output output/airport_output.avi --yolo yolo-coco
 
 # import the necessary packages
+import sys
+import tkinter.tix
+
 import numpy as np
 import argparse
 import imutils
 import time
 import cv2
 import os
+
+from scipy import spatial
+
 import trafficLightColor
+from skimage import transform
+
+
 def up():
     deleted = []
     for n, pair in enumerate(trackersList):
         tracker, box = pair
         (x, y, w, h) = box
-        for n2,pair2 in enumerate(trackersList):
-            if(n == n2):
+        for n2, pair2 in enumerate(trackersList):
+            if (n == n2):
                 continue
             tracker2, box2 = pair2
             (x2, y2, w2, h2) = box2
             val = bb_intersection_over_union([x, y, x + w, y + h], [x2, y2, x2 + w2, y2 + h2])
-            if(val > 0.4):
+            if (val > 0.4):
                 deleted.append(n)
                 break
     print(deleted)
     for i in deleted:
         del trackersList[i]
-displayCounter = 0
 
+
+displayCounter = 0
 
 
 def bb_intersection_over_union(boxA, boxB):
@@ -52,20 +62,22 @@ def bb_intersection_over_union(boxA, boxB):
 
     # return the intersection over union value
     return iou
+
+
 # construct the argument parse and parse the arguments
 ap = argparse.ArgumentParser()
 ap.add_argument("-i", "--input", required=True,
-	help="path to input video")
+                help="path to input video")
 ap.add_argument("-o", "--output", required=True,
-	help="path to output video")
+                help="path to output video")
 ap.add_argument("-y", "--yolo", required=True,
-	help="base path to YOLO directory")
-ap.add_argument("-c", "--confidence", type=float, default=0.5,
-	help="minimum probability to filter weak detections")
-ap.add_argument("-t", "--threshold", type=float, default=0.3,
-	help="threshold when applyong non-maxima suppression")
+                help="base path to YOLO directory")
+ap.add_argument("-c", "--confidence", type=float, default=0.9,
+                help="minimum probability to filter weak detections")
+ap.add_argument("-t", "--threshold", type=float, default=0.1,
+                help="threshold when applyong non-maxima suppression")
 args = vars(ap.parse_args())
-
+total = 0
 # load the COCO class labels our YOLO model was trained on
 labelsPath = os.path.sep.join([args["yolo"], "coco.names"])
 LABELS = open(labelsPath).read().strip().split("\n")
@@ -73,7 +85,7 @@ LABELS = open(labelsPath).read().strip().split("\n")
 # initialize a list of colors to represent each possible class label
 np.random.seed(42)
 COLORS = np.random.randint(0, 255, size=(len(LABELS), 3),
-	dtype="uint8")
+                           dtype="uint8")
 
 # derive the paths to the YOLO weights and model configuration
 weightsPath = os.path.sep.join([args["yolo"], "yolov3.weights"])
@@ -84,11 +96,10 @@ configPath = os.path.sep.join([args["yolo"], "yolov3.cfg"])
 print("[INFO] loading YOLO from disk...")
 net = cv2.dnn.readNetFromDarknet(configPath, weightsPath)
 ln = net.getLayerNames()
-outputlayers = [ln[i-1] for i in net.getUnconnectedOutLayers()]
+outputlayers = [ln[i - 1] for i in net.getUnconnectedOutLayers()]
 
-#outputlayers = [ln[i[0] - 1][i-1] for i in net.getUnconnectedOutLayers()]
 ln = outputlayers
-#ln = [ln[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+# ln = [ln[i[0] - 1] for i in net.getUnconnectedOutLayers()]
 
 # initialize the video stream, pointer to output video file, and
 # frame dimensions
@@ -99,51 +110,83 @@ writer = None
 
 # try to determine the total number of frames in the video file
 try:
-	prop = cv2.cv.CV_CAP_PROP_FRAME_COUNT if imutils.is_cv2() \
-		else cv2.CAP_PROP_FRAME_COUNT
-	total = int(vs.get(prop))
-	print("[INFO] {} total frames in video".format(total))
+    prop = cv2.cv.CV_CAP_PROP_FRAME_COUNT if imutils.is_cv2() \
+        else cv2.CAP_PROP_FRAME_COUNT
+    total = int(vs.get(prop))
+    print("[INFO] {} total frames in video".format(total))
 
 # an error occurred while trying to determine the total
 # number of frames in the video file
 except:
-	print("[INFO] could not determine # of frames in video")
-	print("[INFO] no approx. completion time can be provided")
-	total = -1
+    print("[INFO] could not determine # of frames in video")
+    print("[INFO] no approx. completion time can be provided")
+    total = -1
 
-
-
-
-
-
-#-------------------------------------
+# -------------------------------------
 OPENCV_OBJECT_TRACKERS = {
-	"csrt": cv2.legacy.TrackerCSRT_create,
-	"kcf": cv2.legacy.TrackerKCF_create,
-	"boosting": cv2.legacy.TrackerBoosting_create,
-	"mil": cv2.legacy.TrackerMIL_create,
-	"mosse": cv2.legacy.TrackerMOSSE_create
+    "csrt": cv2.legacy.TrackerCSRT_create,
+    "kcf": cv2.legacy.TrackerKCF_create,
+    "boosting": cv2.legacy.TrackerBoosting_create,
+    "mil": cv2.legacy.TrackerMIL_create,
+    "mosse": cv2.legacy.TrackerMOSSE_create
 }
 
-def setLightCoordinates():
-    vss = cv2.VideoCapture(args["input"])
+vss = cv2.VideoCapture(args["input"])
+
+
+def read_frame(vss):
     while True:
-        W=None
-        H=None
-        # read the next frame from the file
         (grabbed, frame) = vss.read()
         if not grabbed:
-            break
+            return None
         else:
             frame = cv2.resize(frame, (1000, 750))
-        # if the frame dimensions are empty, grab them
+        return frame
+
+
+# car should stop on red light
+def zoom_to_stop_frame():
+    global stop_frame
+    global stop_frame_number
+    max_similarity_rate = 0
+    curr_frame_number = 0
+    while True:
+        # read the next frame from the file
+        frame1 = read_frame(vss)
+        frame2 = read_frame(vss)
+        curr_frame_number = curr_frame_number + 2
+        if frame1 is not None and frame2 is not None:
+            frame1_vector = frame1.ravel()
+            frame2_vector = frame2.ravel()
+            result = 1 - spatial.distance.cosine(frame1_vector, frame2_vector)
+
+            if result > max_similarity_rate:
+                max_similarity_rate = result
+                stop_frame = frame2
+                stop_frame_number = curr_frame_number
+        else:
+            return stop_frame, stop_frame_number
+
+
+def setLightCoordinates():
+    # vss = cv2.VideoCapture(args["input"])
+    while True:
+        W = None
+        H = None
+        # # read the next frame from the file
+        # (grabbed, frame) = vss.read()
+        # if not grabbed:
+        #     break
+        # else:
+        #     frame = cv2.resize(frame, (1000, 750))
+        # # if the frame dimensions are empty, grab them
         if W is None or H is None:
-            (H, W) = frame.shape[:2]
+            (H, W) = stop_frame.shape[:2]
 
         # construct a blob from the input frame and then perform a forward
         # pass of the YOLO object detector, giving us our bounding boxes
         # and associated probabilities
-        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416),
+        blob = cv2.dnn.blobFromImage(stop_frame, 1 / 255.0, (416, 416),
                                      swapRB=True, crop=False)
         net.setInput(blob)
         start = time.time()
@@ -204,36 +247,92 @@ def setLightCoordinates():
                 # draw a bounding box rectangle and label on the frame
                 color = [int(c) for c in COLORS[classIDs[i]]]
                 if (classIDs[i] == 9):
-
                     vss.release()
-                    cv2.imshow('r',frame[y:y + h, x:x + w])
+                    cv2.imshow('r', stop_frame[y:y + h, x:x + w])
                     cv2.waitKey()
-                    return (x,y,w,h)
+                    return (x, y, w, h)
 
 
 # trackers = cv2.MultiTracker_create()
 
-#-----------------------------------
+# -----------------------------------
 
 
-
-
+stop_frame, stop_frame_number = zoom_to_stop_frame()
 listAll = []
-xlight,ylight,wlight,hlight = setLightCoordinates()
+xlight, ylight, wlight, hlight = setLightCoordinates()
+
+
+def getMaximalLightThreshold():
+    vss2 = cv2.VideoCapture(args["input"])
+    max = 0
+    i = 0
+    while i < total:
+        frame = read_frame(vss2)
+        temp = frame.copy()
+        temp2 = frame.copy()
+        i = i + 1
+        grayscaled = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        th = cv2.adaptiveThreshold(grayscaled, 250, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 115, 1)
+        kernel = np.ones((3, 3), np.uint8)
+        th = cv2.erode(th, kernel, iterations=1)
+        th = cv2.dilate(th, kernel, iterations=2)
+        contours, hierarchy = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_KCOS)
+        # cv2.imshow('cont',ct)
+        # cv2.waitKey()
+        cv2.destroyAllWindows()
+        # im2, contours, hierarchy = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contIndex = 0
+        allContours = []
+        for contour in contours:
+            M = cv2.moments(contour)
+            if (cv2.contourArea(contour) > 800):
+                # print('length: ',len(contour))
+                if (len(contour) < 100):
+                    peri = cv2.arcLength(contour, True)
+                    approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+                    if (len(approx) == 4):
+                        x, y, w, h = cv2.boundingRect(contour)
+                        cv2.drawContours(frame, contours, contIndex, (0, 255, 0), 3)
+                        cv2.rectangle(temp, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                        allContours.append((x, y, w, h))
+            contIndex = contIndex + 1
+
+        cv2.drawContours(temp2, contours, -1, (0, 255, 0), 3)
+        frame = temp
+        minIndex = 0
+        count = 0
+        minDistance = 10000000
+        for rect in allContours:
+            x, y, w, h = rect
+            if (ylight + wlight < y):
+                cv2.line(temp, (xlight, ylight), (x, y), (0, 0, 255), 2)
+                if (((x - xlight) ** 2 + (y - ylight) ** 2) ** 0.5) < minDistance:
+                    minDistance = (((x - xlight) ** 2 + (y - ylight) ** 2) ** 0.5)
+                    minIndex = count
+            count = count + 1
+        if minIndex < len(allContours):
+            (x, y, w, h) = allContours[minIndex]
+            if y > max:
+                max = y
+                print(max)
+    vss2.release()
+    return max
+
 
 def getLightThresh(showStages=True):
-    vss = cv2.VideoCapture(args["input"])
-    (grabbed, frame) = vss.read()
+    # frame = cv2.resize(frame, (1000, 750))
+    # if(showStages==True):
+    #     cv2.imshow('fr',frame)
+    #     cv2.waitKey()
+    #     cv2.destroyAllWindows()
+    temp = stop_frame.copy()
+    temp2 = stop_frame.copy()
+    imgray = cv2.cvtColor(temp, cv2.COLOR_BGR2GRAY)
+    ret, thresh = cv2.threshold(imgray, 127, 255, 0)
+    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-
-    frame = cv2.resize(frame, (1000, 750))
-    if(showStages==True):
-        cv2.imshow('fr',frame)
-        cv2.waitKey()
-        cv2.destroyAllWindows()
-    temp =frame.copy()
-    temp2=frame.copy()
-    grayscaled = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    grayscaled = cv2.cvtColor(stop_frame, cv2.COLOR_BGR2GRAY)
     th = cv2.adaptiveThreshold(grayscaled, 250, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 115, 1)
     kernel = np.ones((3, 3), np.uint8)
     th = cv2.erode(th, kernel, iterations=1)
@@ -241,8 +340,8 @@ def getLightThresh(showStages=True):
     # # kernel = np.ones((5, 5), np.uint8)
     # # th = cv2.erode(th, kernel, iterations=1)
     # # th = cv2.dilate(th, kernel, iterations=2)
-    if(showStages==True):
-        cv2.imshow('thresh',th)
+    if (showStages == True):
+        cv2.imshow('thresh', th)
         cv2.waitKey()
         cv2.destroyAllWindows()
     contours, hierarchy = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_KCOS)
@@ -254,54 +353,55 @@ def getLightThresh(showStages=True):
     allContours = []
     for contour in contours:
         M = cv2.moments(contour)
-        if(cv2.contourArea(contour)>800):
+        if (cv2.contourArea(contour) > 800):
             # print('length: ',len(contour))
-            if(len(contour)<100):
+            if (len(contour) < 100):
                 peri = cv2.arcLength(contour, True)
                 approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
-                if(len(approx)==4):
+                if (len(approx) == 4):
                     x, y, w, h = cv2.boundingRect(contour)
-                    cv2.drawContours(frame, contours, contIndex, (0, 255, 0), 3)
-                    cv2.rectangle(temp,(x,y),(x+w,y+h),(255,0,0),2)
-                    allContours.append((x,y,w,h))
+                    cv2.drawContours(stop_frame, contours, contIndex, (0, 255, 0), 3)
+                    cv2.rectangle(temp, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                    allContours.append((x, y, w, h))
         contIndex = contIndex + 1
 
     cv2.drawContours(temp2, contours, -1, (0, 255, 0), 3)
-    if(showStages==True):
-        cv2.imshow('frame',temp2)
-        cv2.waitKey()
-        cv2.destroyAllWindows()
-        cv2.imshow('frame',frame)
-        cv2.waitKey()
-        cv2.destroyAllWindows()
-        cv2.imshow('frame',temp)
-        cv2.waitKey()
-        cv2.destroyAllWindows()
+    # if (showStages == True):
+    #     cv2.imshow('frame', temp2)
+    #     cv2.waitKey()
+    #     cv2.destroyAllWindows()
+    #     cv2.imshow('frame', stop_frame)
+    #     cv2.waitKey()
+    #     cv2.destroyAllWindows()
+    #     cv2.imshow('frame', temp)
+    #     cv2.waitKey()
+    #     cv2.destroyAllWindows()
 
     # cv2.imshow('x',frame)
     # cv2.waitKey()
-    frame=temp
+    frame = temp
     minIndex = 0
-    count=0
+    count = 0
     minDistance = 10000000
     for rect in allContours:
-        x,y,w,h = rect
-        if(ylight+wlight<y):
-         cv2.line(temp, (xlight,ylight), (x, y), (0, 0, 255), 2)
-         if (((x-xlight)**2 + (y-ylight)**2)**0.5) < minDistance:
-             minDistance = (((x-xlight)**2 + (y-ylight)**2)**0.5)
-             minIndex=count
-        count=count+1
-    (x,y,w,h) = allContours[minIndex]
-    if(showStages==True):
-        cv2.imshow('with-dist',temp)
-        cv2.waitKey()
-        cv2.destroyAllWindows()
-        cv2.line(temp, (0, y), (1300, y), (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.imshow('with-dist',temp)
-        cv2.waitKey()
-        cv2.destroyAllWindows()
+        x, y, w, h = rect
+        if (ylight + wlight < y):
+            cv2.line(temp, (xlight, ylight), (x, y), (0, 0, 255), 2)
+            if (((x - xlight) ** 2 + (y - ylight) ** 2) ** 0.5) < minDistance:
+                minDistance = (((x - xlight) ** 2 + (y - ylight) ** 2) ** 0.5)
+                minIndex = count
+        count = count + 1
+    (x, y, w, h) = allContours[minIndex]
+    # if (showStages == True):
+    #     cv2.imshow('with-dist', temp)
+    #     cv2.waitKey()
+    #     cv2.destroyAllWindows()
+    #     cv2.line(temp, (0, y), (1300, y), (0, 0, 0), 4, cv2.LINE_AA)
+    #     cv2.imshow('with-dist', temp)
+    #     cv2.waitKey()
+    #     cv2.destroyAllWindows()
     vss.release()
+    print('asasd', y)
     return y
 
 
@@ -310,16 +410,18 @@ ctr = 0
 penaltyList = []
 redLightViolatedCounter = 0
 
-thresholdRedLight = getLightThresh(showStages=True)
+thresholdRedLight = 550
 trackersList = []
 redTrackers = []
 recentlyViolated = []
 redTrackingCounters = []
 iDsWithIoUList = []
 idCounter = 0
+
+red_frame_count = 0
 def updateTrackers(image):
     print('update')
-    global displayCounter
+    global displayCounter, red_frame_count
     global redTrackers
     global redLightViolatedCounter
     global recentlyViolated
@@ -337,7 +439,6 @@ def updateTrackers(image):
 
         boxes.append(bbox)  # Return updated box list
 
-
         xmin = int(bbox[0])
         ymin = int(bbox[1])
         xmax = int(bbox[0] + bbox[2])
@@ -347,21 +448,23 @@ def updateTrackers(image):
         light = frame[ylight:ylight + hlight, xlight:xlight + wlight]
         b, g, r = cv2.split(light)
         light = cv2.merge([r, g, b])
-
-
-
-        if(ymid < thresholdRedLight and trafficLightColor.estimate_label(light)=="red" ):
+        # cv2.imshow("Current Frame", frame)
+        # cv2.waitKey(0)
+        if (ymid < thresholdRedLight and trafficLightColor.estimate_label(light) == "red"):
+            red_frame_count = red_frame_count + 1
             displayCounter = 10
             print(displayCounter)
             clone = image.copy()
             cv2.line(clone, (0, thresholdRedLight), (1300, thresholdRedLight), (0, 0, 0), 4, cv2.LINE_AA)
-
+            output_file = "violation" + str(red_frame_count) + ".jpg"
+            cv2.imwrite(output_file, clone)
+            # cv2.waitKey(0)
             print(trafficLightColor.estimate_label(light))
             cv2.rectangle(clone, (xmax, ymax), (xmin, ymin), (0, 255, 0), 2)
             print(redLightViolatedCounter)
             redLightViolatedCounter = redLightViolatedCounter + 1
             print(trackersList[n])
-            recentlyViolated.append((trackersList[n][1],10))
+            recentlyViolated.append((trackersList[n][1], 10))
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -377,7 +480,7 @@ def updateTrackers(image):
             print("__")
             print(bbox)
             print("rab ah")
-            #password
+            # password
             # cv2.imshow('please', clone)
             # cv2.waitKey(0)
             # cv2.destroyAllWindows()
@@ -390,7 +493,7 @@ def updateTrackers(image):
             print(iDsWithIoUList)
             for n, item in enumerate(iDsWithIoUList):
                 print(item)
-                ___, id, listWithFrame,violationList = item
+                ___, id, listWithFrame, violationList = item
                 print(listWithFrame)
                 box2, __ = listWithFrame[len(listWithFrame) - 1]
                 print(item)
@@ -404,22 +507,20 @@ def updateTrackers(image):
 
                 if (val > 0.20):
                     ___ = True
-                    iDsWithIoUList[n] = (___, id, listWithFrame,[(box,ctr)])
+                    iDsWithIoUList[n] = (___, id, listWithFrame, [(box, ctr)])
                     break
             if len(trackersList) >= n:
                 print(len(trackersList), '-------', 'n=', n)
-                tracker, box = trackersList[n-1]
+                tracker, box = trackersList[n - 1]
                 print(box)
                 print("____")
-                redTrackers.append(trackersList[n-1])
+                redTrackers.append(trackersList[n - 1])
                 redTrackingCounters.append(10)
-                del trackersList[n-1]
+                del trackersList[n - 1]
             # print(box)
             # print("__")
             # print(bbox)
             # print("rab ah")
-
-
 
         # here will check if it passes the red light
     return boxes
@@ -438,16 +539,15 @@ def updateRedTrackers(image):
 
         redTrackingCounters[n] = redTrackingCounters[n] - 1
 
-        if(redTrackingCounters[n] > 0):
+        if (redTrackingCounters[n] > 0):
 
             (xt, yt, wt, ht) = bbox
-
 
             for n, item in enumerate(iDsWithIoUList):
                 print(item)
                 ___, id, listWithFrame, violationList = item
 
-                if(___ == False):
+                if (___ == False):
                     continue
                 print(listWithFrame)
                 box2, __ = listWithFrame[len(listWithFrame) - 1]
@@ -461,8 +561,8 @@ def updateRedTrackers(image):
                 print("IoU_______")
 
                 if (val > 0.20):
-                    violationList.append(([bbox],ctr))
-                    iDsWithIoUList[n] = (___, id, listWithFrame,violationList)
+                    violationList.append(([bbox], ctr))
+                    iDsWithIoUList[n] = (___, id, listWithFrame, violationList)
                     break
 
             boxes.append(bbox)  # Return updated box list
@@ -473,9 +573,6 @@ def updateRedTrackers(image):
             ymax = int(bbox[1] + bbox[3])
             xmid = int(round((xmin + xmax) / 2))
             ymid = int(round((ymin + ymax) / 2))
-
-
-
 
             cv2.rectangle(clonedImage, (xmax, ymax), (xmin, ymin), (0, 0, 255), 2)
     return clonedImage
@@ -491,23 +588,16 @@ def add_object(image, box):
         trackersList.append((tracker, (x, y, w, h)))
 
 
-
-
-
-
 startTime = time.time()
 # loop over frames from the video file stream
 
 
 prevCurrentList = []
 
-
 while True:
-
-
     print(thresholdRedLight)
     (grabbed, frame) = vs.read()
-    if(not grabbed):
+    if (not grabbed):
         break
     else:
         frame = cv2.resize(frame, (1000, 750))
@@ -515,7 +605,7 @@ while True:
     frameTemp3 = frame.copy()
     boxesTemp = updateTrackers(frame)
 
-    if(ctr % 5== 0):
+    if (ctr % 5 == 0):
 
         # frameTemp = imutils.resize(frame, width=600)
         frameTemp = frame.copy()
@@ -523,14 +613,9 @@ while True:
         cv2.line(frameTemp, (0, thresholdRedLight), (1300, thresholdRedLight), (0, 0, 0), 4, cv2.LINE_AA)
         # Draw the running total of cars in the image in the upper-left corner
 
-
-
         # boxesTemp = updateTrackers(frame)
 
-
         # (success, boxesTemp) = trackers.update(frame)
-
-
 
         print('tracker boxes : ')
         print(boxesTemp)
@@ -551,7 +636,6 @@ while True:
         # cv2.waitKey(0)
         # cv2.destroyAllWindows()
 
-
         # read the next frame from the file
         # print(ctr)
         # if the frame was not grabbed, then we have reached the end
@@ -567,7 +651,7 @@ while True:
         # pass of the YOLO object detector, giving us our bounding boxes
         # and associated probabilities
         blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416),
-            swapRB=True, crop=False)
+                                     swapRB=True, crop=False)
         net.setInput(blob)
         start = time.time()
         layerOutputs = net.forward(ln)
@@ -607,7 +691,7 @@ while True:
 
                     # update our list of bounding box coordinates,
                     # confidences, and class IDs
-                    if(classID ==2 or classID==7 or classID ==3 or classID == 9):
+                    if (classID == 2 or classID == 7 or classID == 3 or classID == 9):
                         boxes.append([x, y, int(width), int(height)])
                         confidences.append(float(confidence))
                         classIDs.append(classID)
@@ -615,9 +699,7 @@ while True:
         # apply non-maxima suppression to suppress weak, overlapping
         # bounding boxes
         idxs = cv2.dnn.NMSBoxes(boxes, confidences, args["confidence"],
-            args["threshold"])
-
-
+                                args["threshold"])
 
         currentBoxes = []
 
@@ -630,17 +712,12 @@ while True:
                 (w, h) = (boxes[i][2], boxes[i][3])
 
                 # if ((y + y + h) / 2 > thresholdRedLight):
-                currentBoxes.append((x,y,w,h))
+                currentBoxes.append((x, y, w, h))
                 # draw a bounding box rectangle and label on the frame
-
-
-
-
-
 
                 cv2.rectangle(frameTemp2, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
-        #password
+        # password
         # cv2.imshow("Current Frame", frame)
         # cv2.waitKey(0)
         # print('current boxes:')
@@ -649,7 +726,7 @@ while True:
         prevCurrentList = currentBoxes.copy()
         addedBoxes = []
         # print(addedBoxes)
-        #---------------------
+        # ---------------------
         index = 0
         for idx, box in enumerate(boxesTemp):
             if (len(trackersList) == 0):
@@ -659,58 +736,56 @@ while True:
             print('iteration')
             print((x, y, w, h))
             flagg = False
-            yt,ht = 0,0
+            yt, ht = 0, 0
             for idx2, box2 in enumerate(currentBoxes):
                 (x2, y2, w2, h2) = [int(v2) for v2 in box2]
-                val = bb_intersection_over_union([x,y,x+w,y+h],[x2,y2,x2+w2,y2+h2])
+                val = bb_intersection_over_union([x, y, x + w, y + h], [x2, y2, x2 + w2, y2 + h2])
 
                 print(val)
 
-                if(val > .25):
+                if (val > .25):
                     flagg = True
                     i = idx2
-                    yt, ht = y2,h2
+                    yt, ht = y2, h2
                     # print('yes')
                     # if(addedBoxes.__contains__((x2, y2, w2, h2))):
                     #     addedBoxes.remove((x2, y2, w2, h2))
 
-            if(flagg == False):
+            if (flagg == False):
                 del trackersList[index]
                 del boxesTemp[index]
                 index = index - 1
             else:
-                print('INDEX DELETED',index)
-                print('Length',len(trackersList))
+                print('INDEX DELETED', index)
+                print('Length', len(trackersList))
                 del trackersList[index]
-
 
                 index = index - 1
                 # if ((yt + yt + ht) / 2 > thresholdRedLight - 1):
                 addedBoxes.append(currentBoxes[i])
 
-                (xt,yt, wt, ht) = currentBoxes[i]
+                (xt, yt, wt, ht) = currentBoxes[i]
                 print(iDsWithIoUList)
-                for n,item in enumerate(iDsWithIoUList):
+                for n, item in enumerate(iDsWithIoUList):
                     print(item)
-                    ___,id,listWithFrame,violationList = item
+                    ___, id, listWithFrame, violationList = item
                     print(listWithFrame)
                     box2, __ = listWithFrame[len(listWithFrame) - 1]
                     print(item)
                     print(list)
                     (x1, y1, w1, h1) = box2
 
-
                     val = bb_intersection_over_union([xt, yt, xt + wt, yt + ht], [x1, y1, x1 + w1, y1 + h1])
                     print("IoU -------")
                     print(val)
                     print("IoU_______")
-                    if(val > 0.20):
-                        listWithFrame.append((currentBoxes[i],ctr))
-                        iDsWithIoUList[n] = (___, id, listWithFrame,violationList)
+                    if (val > 0.20):
+                        listWithFrame.append((currentBoxes[i], ctr))
+                        iDsWithIoUList[n] = (___, id, listWithFrame, violationList)
                         break
 
             index = index + 1
-        #----------------------
+        # ----------------------
         for idx, box in enumerate(currentBoxes):
             (x, y, w, h) = [int(v) for v in box]
             flagg = False
@@ -722,11 +797,11 @@ while True:
                 if (val > .25):
                     flagg = True
             fl = False
-            if(flagg == False):
+            if (flagg == False):
                 if ((y + y + h) / 2 > thresholdRedLight):
                     addedBoxes.append(box)
                     print(box)
-                    iDsWithIoUList.append((False, idCounter, [(box,ctr)],[]))
+                    iDsWithIoUList.append((False, idCounter, [(box, ctr)], []))
                     idCounter = idCounter + 1
         print("______________")
         print("iDs with IoU")
@@ -738,31 +813,30 @@ while True:
         print('enter input to continue')
         # varss = input()
         print(len(boxesTemp))
-        print('TRACKER LIST LENGTH: ',len(trackersList))
+        print('TRACKER LIST LENGTH: ', len(trackersList))
         print(len(penaltyList))
         for box in addedBoxes:
-            add_object(frameTemp2,box)
+            add_object(frameTemp2, box)
             penaltyList.append(0)
         print("_____________")
         print(len(trackersList))
         print(len(penaltyList))
 
-
         print('enter input to continue')
         # varss = input()
         # check if the video writer is None
     frameTemp3 = updateRedTrackers(frameTemp3)
-    if(ylight!=None):
-     light = frame[ylight:ylight + hlight, xlight:xlight + wlight]
-     b, g, r = cv2.split(light)
-     light=cv2.merge([r,g,b])
-     greenCount = 0
-     if(trafficLightColor.estimate_label(light)=="green"):
-      print('GREEEENNNN')
-      cv2.imwrite('green.png',light)
-     # cv2.waitKey()
-     cv2.putText(frameTemp3, trafficLightColor.estimate_label(light), (xlight, ylight),
-                 cv2.FONT_HERSHEY_DUPLEX, 1.5, (255, 255, 255), 2, cv2.LINE_AA)
+    if (ylight != None):
+        light = frame[ylight:ylight + hlight, xlight:xlight + wlight]
+        b, g, r = cv2.split(light)
+        light = cv2.merge([r, g, b])
+        greenCount = 0
+        if (trafficLightColor.estimate_label(light) == "green"):
+            print('GREEEENNNN')
+            cv2.imwrite('green.png', light)
+        # cv2.waitKey()
+        cv2.putText(frameTemp3, trafficLightColor.estimate_label(light), (xlight, ylight),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.5, (255, 255, 255), 2, cv2.LINE_AA)
 
     cv2.line(frameTemp3, (0, thresholdRedLight), (1300, thresholdRedLight), (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(frameTemp3, 'Violation Counter: ' + str(redLightViolatedCounter), (30, 60),
@@ -782,7 +856,7 @@ while True:
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(args["output"], fourcc, fps
                                  ,
-            (frameTemp3.shape[1], frameTemp3.shape[0]), True)
+                                 (frameTemp3.shape[1], frameTemp3.shape[0]), True)
 
         # some information on processing single frame
         if total > 0:
@@ -790,14 +864,14 @@ while True:
             print("[INFO] single frame took {:.4f} seconds".format(elap))
             print("[INFO] estimated total time to finish: {:.4f}".format(
                 elap * total))
-    #password
+    # password
     # write the output frame to disk
     # cv2.imshow('OUTPUT',frameTemp2)
     # cv2.waitKey(0)
     # cv2.destroyAllWindows()
     writer.write(frameTemp3)
-    #cv2.imshow('frame',frameTemp3)
-    #cv2.waitKey()
+    # cv2.imshow('frame',frameTemp3)
+    # cv2.waitKey()
     ctr = ctr + 1
     print(ctr)
 
